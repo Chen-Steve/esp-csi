@@ -80,7 +80,7 @@
 ![esp_crab_pcb_front](doc/img/esp_crab_pcb_front.png)
 ![esp_crab_pcb_back](doc/img/esp_crab_pcb_back.jpg)
 
-参考 [PCB V1.1](doc/PCB_ESP_CRAB_ESP32C5_V1_1.pdf) 和 [SCH V1.1](doc/SCH_ESP_CRAB_ESP32C5_V1_1.pdf) 查看PCB的原理图和PCB。
+参考 [ESP-Crab Circuit Diagram Explanation](<doc/ESP-Crab circuit diagram explanation.pdf>) 查看PCB的引脚说明。
 
 #### 形态介绍
 
