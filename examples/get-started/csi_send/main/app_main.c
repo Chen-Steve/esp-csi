@@ -91,6 +91,9 @@ static void wifi_init()
     }
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+
+    // added to increase power usage
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80))
 }
 
 static void wifi_esp_now_init(esp_now_peer_info_t peer) 

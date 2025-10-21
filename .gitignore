@@ -87,3 +87,5 @@ docs/docusaurus/website/node_modules
 **/managed_components/
 **/*.lock
 **/.vscode
+
+/examples/get-started/tools/venv
