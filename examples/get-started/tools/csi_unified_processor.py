@@ -2,23 +2,19 @@ import sys
 import csv
 import json
 import argparse
-import pandas as pd
 import numpy as np
 import psutil
 import gc
 
 import serial
-from os import path
 from io import StringIO
 from threading import Lock
 from collections import deque
-import time
 
-from PyQt5.Qt import *
+from PyQt5.QtWidgets import QApplication, QWidget
 from pyqtgraph import PlotWidget
 from PyQt5 import QtCore
 import pyqtgraph as pg
-from pyqtgraph import ScatterPlotItem
 from PyQt5.QtCore import pyqtSignal, QThread
 
 CSI_DATA_INDEX = 50  # Reduced from 200 to prevent memory issues
@@ -99,7 +95,6 @@ class SynchronizedData:
     
     def _find_synchronized_pairs(self):
         """Find data pairs from different receivers that are close in time"""
-        print(f"SyncData: Looking for pairs, have {len(self.receiver_data)} receivers")
         if len(self.receiver_data) < 2:
             return
         
@@ -117,7 +112,6 @@ class SynchronizedData:
         
         for rid in receiver_ids[1:]:
             time_diff = abs(timestamps[rid] - base_time)
-            print(f"SyncData: Time difference between {receiver_ids[0]} and {rid}: {time_diff} μs (limit: {time_window} μs)")
             if time_diff > time_window:
                 synchronized = False
                 break
@@ -146,36 +140,39 @@ class SynchronizedData:
         
         receiver_ids = list(receivers.keys())
         
-        # Get metadata from first receiver
-        rx1_data = receivers[receiver_ids[0]]
-        rx2_data = receivers[receiver_ids[1]]
-        
-        # Combine CSI data
-        min_len = min(len(rx1_data['csi_complex']), len(rx2_data['csi_complex']))
+        # Get minimum CSI length across ALL receivers
+        min_len = min(len(receivers[rid]['csi_complex']) for rid in receiver_ids)
         combined_csi = []
         
         for i in range(min_len):
-            # Average in complex plane (better than averaging amplitude and phase separately)
-            z1 = rx1_data['csi_complex'][i]
-            z2 = rx2_data['csi_complex'][i]
-            z_avg = 0.5 * (z1 + z2)
+            # Average in complex plane across ALL receivers (better than averaging amplitude and phase separately)
+            complex_values = [receivers[rid]['csi_complex'][i] for rid in receiver_ids]
+            z_avg = np.mean(complex_values)  # Average all receivers
             
             # Convert back to I/Q format (convert to Python float for JSON)
             # Format: [Imaginary, Real] pairs as per original convention
             combined_csi.append(float(z_avg.imag))  # Imaginary
             combined_csi.append(float(z_avg.real))  # Real
         
+        # Average metadata across ALL receivers
+        avg_rssi = int(np.mean([receivers[rid]['rssi'] for rid in receiver_ids]))
+        avg_fft_gain = int(np.mean([receivers[rid]['fft_gain'] for rid in receiver_ids]))
+        avg_agc_gain = int(np.mean([receivers[rid]['agc_gain'] for rid in receiver_ids]))
+        
+        # Create combined MAC field showing all receivers
+        combined_mac = "+".join(receiver_ids)
+        
         # Create CSV row (use format from first receiver, mark as combined)
         # We'll use a simplified format: just the essential fields + combined data
         combined_row = [
             "CSI_DATA_COMBINED",
             0,  # id
-            f"{receiver_ids[0]}+{receiver_ids[1]}",  # combined MAC
-            int((rx1_data['rssi'] + rx2_data['rssi']) / 2),  # avg RSSI
+            combined_mac,  # combined MAC showing all receivers
+            avg_rssi,  # avg RSSI across all receivers
             11,  # rate (placeholder)
             -95,  # noise_floor (placeholder)
-            int((rx1_data['fft_gain'] + rx2_data['fft_gain']) / 2),  # fft_gain
-            int((rx1_data['agc_gain'] + rx2_data['agc_gain']) / 2),  # agc_gain
+            avg_fft_gain,  # avg fft_gain across all receivers
+            avg_agc_gain,  # avg agc_gain across all receivers
             11,  # channel
             combined_entry['timestamp'],  # local_timestamp
             0,  # sig_len
@@ -267,7 +264,7 @@ def generate_subcarrier_colors(red_range, green_range, yellow_range, total_num, 
             colors.append((200, 200, 200))  
     return colors
 
-def csi_data_read_parse(port: str, receiver_id: str, csv_writer, log_file_fd, callback=None):
+def csi_data_read_parse(port: str, receiver_id: str, csv_writer, log_file_fd, subthread=None, callback=None):
     global synced_data
     
     try:
@@ -290,9 +287,6 @@ def csi_data_read_parse(port: str, receiver_id: str, csv_writer, log_file_fd, ca
     while True:
         try:
             loop_count += 1
-            if loop_count % 100 == 0:  # Every 100 loops, show we're alive
-                print(f"{receiver_id}: Loop {loop_count}, waiting for data...")
-            
             line = ser.readline()
             if not line:
                 continue  # Timeout occurred, try again
@@ -351,6 +345,16 @@ def csi_data_read_parse(port: str, receiver_id: str, csv_writer, log_file_fd, ca
             log_file_fd.write(strings + '\n')
             log_file_fd.flush()
             continue
+
+        # Write CSV header on first packet (now that we know the format)
+        if subthread and not subthread.header_written:
+            if len(csi_data) == len(DATA_COLUMNS_NAMES_C5C6):
+                csv_writer.writerow(DATA_COLUMNS_NAMES_C5C6)
+                print(f"{receiver_id}: Writing ESP32-C5/C6 format header")
+            else:
+                csv_writer.writerow(DATA_COLUMNS_NAMES)
+                print(f"{receiver_id}: Writing standard ESP32 format header")
+            subthread.header_written = True
 
         # Extract metadata
         timestamp_idx = 9 if len(csi_data) == len(DATA_COLUMNS_NAMES_C5C6) else 18
@@ -413,12 +417,13 @@ class SubThread (QThread):
         save_file_fd = open(save_file_name, 'w')
         self.log_file_fd = open(log_file_name, 'w')
         self.csv_writer = csv.writer(save_file_fd)
-        self.csv_writer.writerow(DATA_COLUMNS_NAMES)
+        # Note: Header will be written after detecting data format in first packet
         self.save_file_fd = save_file_fd
+        self.header_written = False
 
     def run(self):
         csi_data_read_parse(self.serial_port, self.receiver_id, self.csv_writer, self.log_file_fd,
-                           callback=lambda rid, colors: self.data_ready.emit(rid, colors))
+                           subthread=self, callback=lambda rid, colors: self.data_ready.emit(rid, colors))
 
     def __del__(self):
         self.wait()
