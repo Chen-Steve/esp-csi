@@ -5,3 +5,4 @@ path
 PyQt5
 pyqtgraph
 pyserial
+scikit-learn==1.6.1
