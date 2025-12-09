@@ -7,44 +7,30 @@ import pickle
 import serial
 from io import StringIO
 from threading import Lock
-from collections import deque
-from datetime import datetime
+from collections import deque, Counter
 from scipy import signal
 from scipy.stats import skew, kurtosis
-import sklearn
 
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, 
-    QFrame, QProgressBar
-)
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QFont
 
 # Config
-PACKET_RATE = 100
+PACKET_RATE = 20
 WINDOW_SEC = 2.0
 STEP_SEC = 0.5
 
 WINDOW_SIZE = int(WINDOW_SEC * PACKET_RATE)
-STEP_SIZE = int(STEP_SEC * PACKET_RATE)
 
-LABELS = {0: "empty", 1: "person"}
+# Display labels
+DISPLAY_LABELS = {0: "NO", 1: "YES"}
+
+DEFAULT_FEATURE_ORDER = ['mean', 'std', 'var', 'range', 'skew', 'kurtosis', 
+                         'diff_mean', 'diff_std', 'spatial_var', 
+                         'spectral_energy', 'motion_energy']
 
 DATA_COLUMNS_NAMES_C5C6 = ["type", "id", "mac", "rssi", "rate", "noise_floor", 
                            "fft_gain", "agc_gain", "channel", "local_timestamp",
                            "sig_len", "rx_state", "len", "first_word", "data"]
-
-# Colors
-DARK_BG = "#1e1e2e"
-CARD_BG = "#2a2a3e"
-TEXT_PRIMARY = "#ffffff"
-TEXT_DIM = "#888888"
-GREEN = "#4ade80"
-BLUE = "#60a5fa"
-YELLOW = "#fbbf24"
-RED = "#f87171"
-
-PREDICTION_COLORS = {0: GREEN, 1: BLUE, 2: YELLOW, 3: RED}
 
 
 def bandpass(data, fs, low=0.1, high=5.0):
@@ -110,65 +96,52 @@ def extract_features(amp):
     return f
 
 
-FEATURE_ORDER = ['mean', 'std', 'var', 'range', 'skew', 'kurtosis', 
-                 'diff_mean', 'diff_std', 'spatial_var', 
-                 'spectral_energy', 'motion_energy']
-
-
-def features_to_array(features):
-    if features is None:
-        return None
-    return np.array([[features.get(name, 0) for name in FEATURE_ORDER]])
-
-
 class CSIBuffer:
-    def __init__(self, max_size=WINDOW_SIZE * 2):
+    def __init__(self):
         self.lock = Lock()
-        self.csi_buffer = deque(maxlen=max_size)
-        self.agc_buffer = deque(maxlen=max_size)
-        self.fft_buffer = deque(maxlen=max_size)
-        self.packet_count = 0
+        self.csi_buffer = deque(maxlen=WINDOW_SIZE * 2)
+        self.agc_buffer = deque(maxlen=WINDOW_SIZE * 2)
+        self.fft_buffer = deque(maxlen=WINDOW_SIZE * 2)
     
     def add_packet(self, csi_complex, agc_gain, fft_gain):
         with self.lock:
             self.csi_buffer.append(csi_complex.copy())
             self.agc_buffer.append(agc_gain)
             self.fft_buffer.append(fft_gain)
-            self.packet_count += 1
     
-    def get_window(self, size=WINDOW_SIZE):
+    def get_window(self):
         with self.lock:
-            if len(self.csi_buffer) < size:
+            if len(self.csi_buffer) < WINDOW_SIZE:
                 return None, None, None
-            return (list(self.csi_buffer)[-size:],
-                    list(self.agc_buffer)[-size:],
-                    list(self.fft_buffer)[-size:])
+            return (list(self.csi_buffer)[-WINDOW_SIZE:],
+                    list(self.agc_buffer)[-WINDOW_SIZE:],
+                    list(self.fft_buffer)[-WINDOW_SIZE:])
     
     def ready(self):
         with self.lock:
             return len(self.csi_buffer) >= WINDOW_SIZE
-
-
-csi_buffer = CSIBuffer()
-
-
-class SerialReaderThread(QThread):
-    packet_received = pyqtSignal(int)
     
-    def __init__(self, port):
+    def size(self):
+        with self.lock:
+            return len(self.csi_buffer)
+
+
+class SerialReader(QThread):
+    packet_received = pyqtSignal()
+    
+    def __init__(self, port, buffer):
         super().__init__()
         self.port = port
+        self.buffer = buffer
         self.running = True
+        self.packet_count = 0
     
     def run(self):
-        global csi_buffer
-        
         try:
-            ser = serial.Serial(port=self.port, baudrate=921600, 
-                               bytesize=8, parity='N', stopbits=1, timeout=1.0)
-            print(f"Connected to {self.port}")
+            ser = serial.Serial(port=self.port, baudrate=921600, timeout=1.0)
+            print(f"Connected: {self.port}")
         except Exception as e:
-            print(f"Failed to connect to {self.port}: {e}")
+            print(f"Failed: {self.port} - {e}")
             return
         
         while self.running:
@@ -178,32 +151,25 @@ class SerialReaderThread(QThread):
                     continue
                 
                 strings = line.decode('utf-8', errors='ignore').strip()
-                if not strings or 'CSI_DATA' not in strings:
+                if 'CSI_DATA' not in strings:
                     continue
                 
-                csv_reader = csv.reader(StringIO(strings))
-                csi_data = next(csv_reader)
-                
+                csi_data = next(csv.reader(StringIO(strings)))
                 if len(csi_data) != len(DATA_COLUMNS_NAMES_C5C6):
                     continue
                 
                 csi_raw = json.loads(csi_data[-1])
                 csi_len = len(csi_raw) // 2
+                csi_complex = np.array([complex(csi_raw[i*2+1], csi_raw[i*2]) for i in range(csi_len)], dtype=np.complex64)
                 
-                csi_complex = np.array([
-                    complex(csi_raw[i*2+1], csi_raw[i*2]) 
-                    for i in range(csi_len)
-                ], dtype=np.complex64)
+                agc = float(csi_data[7])
+                fft = float(csi_data[6])
                 
-                fft_gain = float(csi_data[6])
-                agc_gain = float(csi_data[7])
-                
-                csi_buffer.add_packet(csi_complex, agc_gain, fft_gain)
-                self.packet_received.emit(csi_buffer.packet_count)
-                
+                self.buffer.add_packet(csi_complex, agc, fft)
+                self.packet_count += 1
+                self.packet_received.emit()
             except:
                 continue
-        
         ser.close()
     
     def stop(self):
@@ -212,232 +178,140 @@ class SerialReaderThread(QThread):
 
 class InferenceEngine:
     def __init__(self, model_path):
-        self.model = None
-        self.scaler = None
-        self.load_model(model_path)
-    
-    def load_model(self, path):
-        with open(path, 'rb') as f:
+        with open(model_path, 'rb') as f:
             saved = pickle.load(f)
         
         if isinstance(saved, dict):
             self.model = saved.get('model')
             self.scaler = saved.get('scaler')
+            self.feature_names = saved.get('feature_names', DEFAULT_FEATURE_ORDER)
+            self.labels = saved.get('labels', DISPLAY_LABELS)
+            
+            config = saved.get('config', {})
+            trained_rate = config.get('PACKET_RATE', 'unknown')
+            print(f"\n=== MODEL INFO ===")
+            print(f"Model trained with PACKET_RATE: {trained_rate}")
+            print(f"Live.py using PACKET_RATE: {PACKET_RATE}")
+            if trained_rate != 'unknown' and trained_rate != PACKET_RATE:
+                print(f"WARNING: PACKET_RATE mismatch!")
         else:
             self.model = saved
             self.scaler = None
+            self.feature_names = DEFAULT_FEATURE_ORDER
+            self.labels = DISPLAY_LABELS
         
-        print(f"Loaded: {type(self.model).__name__}")
+        print(f"Model: {type(self.model).__name__}")
+        print(f"==================\n")
     
-    def predict(self, csi_window, agc_window, fft_window):
-        if self.model is None:
-            return None, 0.0
-        
-        amp = preprocess_window(csi_window, agc_window, fft_window)
+    def predict(self, csi, agc, fft):
+        amp = preprocess_window(csi, agc, fft)
         if amp is None:
-            return None, 0.0
+            return None, 0.0, None
         
         features = extract_features(amp)
         if features is None:
-            return None, 0.0
+            return None, 0.0, None
         
-        X = features_to_array(features)
-        if self.scaler is not None:
+        X = np.array([[features.get(name, 0) for name in self.feature_names]])
+        if self.scaler:
             X = self.scaler.transform(X)
         
         pred = self.model.predict(X)[0]
         
         if hasattr(self.model, 'predict_proba'):
-            confidence = np.max(self.model.predict_proba(X)[0])
+            proba = self.model.predict_proba(X)[0]
+            conf = np.max(proba)
         else:
-            confidence = 1.0
+            proba = None
+            conf = 1.0
         
-        return pred, confidence
+        return pred, conf, features
 
 
 class LiveWindow(QWidget):
-    def __init__(self, model_path, ports):
+    def __init__(self, model_path, port):
         super().__init__()
-        self.setWindowTitle("CSI Live")
-        self.setFixedSize(500, 400)
-        self.setStyleSheet(f"background-color: {DARK_BG};")
+        self.setWindowTitle(f"CSI Live - {port}")
+        self.setFixedSize(300, 150)
         
         self.engine = InferenceEngine(model_path)
         self.pred_history = deque(maxlen=5)
+        self.buffer = CSIBuffer()
         
-        self.setup_ui()
+        layout = QVBoxLayout()
         
-        self.readers = []
-        for port in ports:
-            reader = SerialReaderThread(port)
-            reader.packet_received.connect(self.on_packet)
-            reader.start()
-            self.readers.append(reader)
+        self.pred_label = QLabel("Loading...")
+        self.pred_label.setAlignment(Qt.AlignCenter)
+        self.pred_label.setStyleSheet("font-size: 48px; font-weight: bold;")
+        layout.addWidget(self.pred_label)
+        
+        self.conf_label = QLabel("")
+        self.conf_label.setAlignment(Qt.AlignCenter)
+        self.conf_label.setStyleSheet("font-size: 14px; color: gray;")
+        layout.addWidget(self.conf_label)
+        
+        self.status_label = QLabel("Buffer: 0%")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("font-size: 12px; color: gray;")
+        layout.addWidget(self.status_label)
+        
+        self.setLayout(layout)
+        
+        # Single receiver only
+        self.reader = SerialReader(port, self.buffer)
+        self.reader.packet_received.connect(self.on_packet)
+        self.reader.start()
         
         self.timer = QTimer()
         self.timer.timeout.connect(self.run_prediction)
         self.timer.start(int(STEP_SEC * 1000))
-        
-        self.last_count = 0
-        self.last_time = datetime.now()
     
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setSpacing(20)
-        layout.setContentsMargins(30, 30, 30, 30)
-        
-        # Rate indicator
-        rate_layout = QHBoxLayout()
-        rate_layout.addStretch()
-        
-        self.rate_label = QLabel("0 pkt/s")
-        self.rate_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 14px;")
-        rate_layout.addWidget(self.rate_label)
-        
-        layout.addLayout(rate_layout)
-        
-        # Main prediction
-        self.pred_label = QLabel("—")
-        self.pred_label.setAlignment(Qt.AlignCenter)
-        self.pred_label.setStyleSheet(f"""
-            color: {TEXT_PRIMARY};
-            font-size: 72px;
-            font-weight: bold;
-            background-color: {CARD_BG};
-            border-radius: 16px;
-            padding: 40px;
-        """)
-        layout.addWidget(self.pred_label)
-        
-        # Confidence
-        conf_layout = QVBoxLayout()
-        conf_layout.setSpacing(8)
-        
-        conf_header = QHBoxLayout()
-        conf_title = QLabel("Confidence")
-        conf_title.setStyleSheet(f"color: {TEXT_DIM}; font-size: 14px;")
-        conf_header.addWidget(conf_title)
-        
-        self.conf_value = QLabel("—")
-        self.conf_value.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: bold;")
-        conf_header.addStretch()
-        conf_header.addWidget(self.conf_value)
-        conf_layout.addLayout(conf_header)
-        
-        self.conf_bar = QProgressBar()
-        self.conf_bar.setRange(0, 100)
-        self.conf_bar.setTextVisible(False)
-        self.conf_bar.setFixedHeight(8)
-        self.conf_bar.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: {CARD_BG};
-                border-radius: 4px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {BLUE};
-                border-radius: 4px;
-            }}
-        """)
-        conf_layout.addWidget(self.conf_bar)
-        
-        layout.addLayout(conf_layout)
-        
-        # Buffer indicator
-        self.buffer_label = QLabel("Buffer: 0%")
-        self.buffer_label.setAlignment(Qt.AlignCenter)
-        self.buffer_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
-        layout.addWidget(self.buffer_label)
-        
-        self.setLayout(layout)
-    
-    def on_packet(self, count):
-        buffer_pct = min(100, int(len(csi_buffer.csi_buffer) / WINDOW_SIZE * 100))
-        self.buffer_label.setText(f"Buffer: {buffer_pct}%")
-        
-        now = datetime.now()
-        elapsed = (now - self.last_time).total_seconds()
-        if elapsed >= 1.0:
-            rate = (count - self.last_count) / elapsed
-            self.rate_label.setText(f"{rate:.0f} pkt/s")
-            self.last_count = count
-            self.last_time = now
+    def on_packet(self):
+        pct = min(100, int(self.buffer.size() / WINDOW_SIZE * 100))
+        self.status_label.setText(f"Buffer: {pct}% | Packets: {self.reader.packet_count}")
     
     def run_prediction(self):
-        if not csi_buffer.ready():
+        if not self.buffer.ready():
             return
         
-        csi, agc, fft = csi_buffer.get_window()
+        csi, agc, fft = self.buffer.get_window()
         if csi is None:
             return
         
-        pred, conf = self.engine.predict(csi, agc, fft)
+        pred, conf, features = self.engine.predict(csi, agc, fft)
         
         if pred is not None:
+            # Debug print
+            print(f"var={features['var']:.6f}, std={features['std']:.6f}, range={features['range']:.4f} -> pred={pred}, conf={conf:.2f}")
+            
             self.pred_history.append(pred)
             
-            # Majority vote smoothing
             if len(self.pred_history) >= 3:
-                from collections import Counter
                 smoothed = Counter(self.pred_history).most_common(1)[0][0]
             else:
                 smoothed = pred
             
-            label = LABELS.get(smoothed, f"Class {smoothed}")
-            color = PREDICTION_COLORS.get(smoothed, TEXT_PRIMARY)
-            
-            self.pred_label.setText(label.upper())
-            self.pred_label.setStyleSheet(f"""
-                color: {color};
-                font-size: 72px;
-                font-weight: bold;
-                background-color: {CARD_BG};
-                border-radius: 16px;
-                padding: 40px;
-            """)
-            
-            conf_pct = int(conf * 100)
-            self.conf_bar.setValue(conf_pct)
-            self.conf_value.setText(f"{conf_pct}%")
-            
-            # Color bar based on confidence
-            if conf_pct >= 80:
-                bar_color = GREEN
-            elif conf_pct >= 60:
-                bar_color = YELLOW
-            else:
-                bar_color = RED
-            
-            self.conf_bar.setStyleSheet(f"""
-                QProgressBar {{
-                    background-color: {CARD_BG};
-                    border-radius: 4px;
-                }}
-                QProgressBar::chunk {{
-                    background-color: {bar_color};
-                    border-radius: 4px;
-                }}
-            """)
+            label = DISPLAY_LABELS.get(smoothed, f"Class {smoothed}")
+            self.pred_label.setText(label)
+            self.conf_label.setText(f"{int(conf * 100)}% confidence")
     
     def closeEvent(self, event):
-        for reader in self.readers:
-            reader.stop()
-            reader.wait()
+        self.reader.stop()
+        self.reader.wait()
         event.accept()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--model', required=True)
-    parser.add_argument('-p', '--ports', nargs='+', required=True)
-    parser.add_argument('--labels', nargs='+')
+    parser.add_argument('-m', '--model', required=True, help="Model file (.pkl)")
+    parser.add_argument('-p', '--port', required=True, help="Serial port (single receiver)")
     args = parser.parse_args()
     
-    global LABELS
-    if args.labels:
-        LABELS = {i: label for i, label in enumerate(args.labels)}
+    print(f"Using single receiver: {args.port}")
+    print("(Training was done per-receiver, so live should use one receiver too)")
     
     app = QApplication(sys.argv)
-    window = LiveWindow(args.model, args.ports)
+    window = LiveWindow(args.model, args.port)
     window.show()
     sys.exit(app.exec())
 
