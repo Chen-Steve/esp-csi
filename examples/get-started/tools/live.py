@@ -18,6 +18,7 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 PACKET_RATE = 20
 WINDOW_SEC = 2.0
 STEP_SEC = 0.5
+CONFIDENCE_THRESHOLD = 0.5  # 55% confidence minimum
 
 WINDOW_SIZE = int(WINDOW_SEC * PACKET_RATE)
 
@@ -189,7 +190,7 @@ class InferenceEngine:
             
             config = saved.get('config', {})
             trained_rate = config.get('PACKET_RATE', 'unknown')
-            print(f"\n=== MODEL INFO ===")
+            print(f"\n MODEL INFO")
             print(f"Model trained with PACKET_RATE: {trained_rate}")
             print(f"Live.py using PACKET_RATE: {PACKET_RATE}")
             if trained_rate != 'unknown' and trained_rate != PACKET_RATE:
@@ -199,9 +200,6 @@ class InferenceEngine:
             self.scaler = None
             self.feature_names = DEFAULT_FEATURE_ORDER
             self.labels = DISPLAY_LABELS
-        
-        print(f"Model: {type(self.model).__name__}")
-        print(f"==================\n")
     
     def predict(self, csi, agc, fft):
         amp = preprocess_window(csi, agc, fft)
@@ -229,14 +227,19 @@ class InferenceEngine:
 
 
 class LiveWindow(QWidget):
-    def __init__(self, model_path, port):
+    def __init__(self, model_path, ports, conf_threshold):
         super().__init__()
-        self.setWindowTitle(f"CSI Live - {port}")
-        self.setFixedSize(300, 150)
+        self.ports = ports
+        self.conf_threshold = conf_threshold
+        self.setWindowTitle(f"CSI Live - {len(ports)} Receivers")
+        self.setFixedSize(400, 200)
         
         self.engine = InferenceEngine(model_path)
         self.pred_history = deque(maxlen=5)
-        self.buffer = CSIBuffer()
+        
+        # Multiple buffers and readers for each receiver
+        self.buffers = [CSIBuffer() for _ in ports]
+        self.readers = []
         
         layout = QVBoxLayout()
         
@@ -250,68 +253,115 @@ class LiveWindow(QWidget):
         self.conf_label.setStyleSheet("font-size: 14px; color: gray;")
         layout.addWidget(self.conf_label)
         
-        self.status_label = QLabel("Buffer: 0%")
+        self.vote_label = QLabel("")
+        self.vote_label.setAlignment(Qt.AlignCenter)
+        self.vote_label.setStyleSheet("font-size: 12px; color: #666;")
+        layout.addWidget(self.vote_label)
+        
+        self.status_label = QLabel("Buffers: 0%")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("font-size: 12px; color: gray;")
         layout.addWidget(self.status_label)
         
         self.setLayout(layout)
         
-        # Single receiver only
-        self.reader = SerialReader(port, self.buffer)
-        self.reader.packet_received.connect(self.on_packet)
-        self.reader.start()
+        # Start readers for all receivers
+        for i, port in enumerate(ports):
+            reader = SerialReader(port, self.buffers[i])
+            reader.packet_received.connect(self.on_packet)
+            reader.start()
+            self.readers.append(reader)
         
         self.timer = QTimer()
         self.timer.timeout.connect(self.run_prediction)
         self.timer.start(int(STEP_SEC * 1000))
     
     def on_packet(self):
-        pct = min(100, int(self.buffer.size() / WINDOW_SIZE * 100))
-        self.status_label.setText(f"Buffer: {pct}% | Packets: {self.reader.packet_count}")
+        # Show buffer status for all receivers
+        statuses = []
+        total_packets = 0
+        for i, buf in enumerate(self.buffers):
+            pct = min(100, int(buf.size() / WINDOW_SIZE * 100))
+            statuses.append(f"R{i+1}:{pct}%")
+            total_packets += self.readers[i].packet_count
+        self.status_label.setText(f"Buffers: {' | '.join(statuses)} | Total: {total_packets}")
     
     def run_prediction(self):
-        if not self.buffer.ready():
+        # Collect predictions from all ready receivers
+        predictions = []
+        confidences = []
+        all_features = []
+        
+        for i, buf in enumerate(self.buffers):
+            if not buf.ready():
+                continue
+            
+            csi, agc, fft = buf.get_window()
+            if csi is None:
+                continue
+            
+            pred, conf, features = self.engine.predict(csi, agc, fft)
+            
+            if pred is not None and features is not None:
+                # Only count prediction if confidence meets threshold
+                if conf >= self.conf_threshold:
+                    predictions.append(pred)
+                    confidences.append(conf)
+                    all_features.append((i+1, pred, conf, features))
+                    print(f"R{i+1}: var={features['var']:.6f}, std={features['std']:.6f} -> pred={pred}, conf={conf:.2f} ✓")
+                else:
+                    print(f"R{i+1}: var={features['var']:.6f}, std={features['std']:.6f} -> pred={pred}, conf={conf:.2f} (below threshold)")
+        
+        if not predictions:
+            self.vote_label.setText("Waiting for confident predictions...")
             return
         
-        csi, agc, fft = self.buffer.get_window()
-        if csi is None:
-            return
+        # Majority vote across receivers
+        vote_counts = Counter(predictions)
+        voted_pred = vote_counts.most_common(1)[0][0]
+        vote_count = vote_counts[voted_pred]
+        total_votes = len(predictions)
+        avg_conf = np.mean(confidences)
         
-        pred, conf, features = self.engine.predict(csi, agc, fft)
+        # Add to history for temporal smoothing
+        self.pred_history.append(voted_pred)
         
-        if pred is not None:
-            # Debug print
-            print(f"var={features['var']:.6f}, std={features['std']:.6f}, range={features['range']:.4f} -> pred={pred}, conf={conf:.2f}")
-            
-            self.pred_history.append(pred)
-            
-            if len(self.pred_history) >= 3:
-                smoothed = Counter(self.pred_history).most_common(1)[0][0]
-            else:
-                smoothed = pred
-            
-            label = DISPLAY_LABELS.get(smoothed, f"Class {smoothed}")
-            self.pred_label.setText(label)
-            self.conf_label.setText(f"{int(conf * 100)}% confidence")
+        # Smooth over recent predictions
+        if len(self.pred_history) >= 3:
+            smoothed = Counter(self.pred_history).most_common(1)[0][0]
+        else:
+            smoothed = voted_pred
+        
+        label = DISPLAY_LABELS.get(smoothed, f"Class {smoothed}")
+        self.pred_label.setText(label)
+        self.conf_label.setText(f"{int(avg_conf * 100)}% avg confidence")
+        self.vote_label.setText(f"Vote: {vote_count}/{total_votes} receivers agree | Threshold: {int(self.conf_threshold*100)}%")
     
     def closeEvent(self, event):
-        self.reader.stop()
-        self.reader.wait()
+        for reader in self.readers:
+            reader.stop()
+        for reader in self.readers:
+            reader.wait()
         event.accept()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--model', required=True, help="Model file (.pkl)")
-    parser.add_argument('-p', '--port', required=True, help="Serial port (single receiver)")
+    parser.add_argument('-p', '--ports', required=True, nargs='+', 
+                        help="Serial ports (one or more receivers, e.g., -p COM3 COM4 COM5)")
+    parser.add_argument('-c', '--confidence', type=float, default=CONFIDENCE_THRESHOLD,
+                        help=f"Confidence threshold (0.0-1.0, default: {CONFIDENCE_THRESHOLD})")
     args = parser.parse_args()
     
-    print(f"Using single receiver: {args.port}")
-    print("(Training was done per-receiver, so live should use one receiver too)")
+    print(f"\n Multi-Receiver CSI Live ")
+    print(f"Using {len(args.ports)} receivers: {', '.join(args.ports)}")
+    print(f"Confidence threshold: {int(args.confidence * 100)}%")
+    print(f"Predictions below threshold will be ignored")
+    print(f"Majority vote across receivers determines final prediction\n")
     
     app = QApplication(sys.argv)
-    window = LiveWindow(args.model, args.port)
+    window = LiveWindow(args.model, args.ports, args.confidence)
     window.show()
     sys.exit(app.exec())
 
