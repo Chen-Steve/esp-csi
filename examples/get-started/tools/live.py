@@ -47,30 +47,40 @@ def bandpass(data, fs, low=0.1, high=5.0):
 def preprocess_window(csi_buffer, agc_buffer, fft_buffer):
     n_pkt = len(csi_buffer)
     if n_pkt == 0:
-        return None
+        return None, None
     
     n_sc = len(csi_buffer[0])
     amp = np.zeros((n_pkt, n_sc))
+    phase = np.zeros((n_pkt, n_sc))
     
     for i in range(n_pkt):
-        a = np.abs(csi_buffer[i])
+        csi = csi_buffer[i]
         gain_db = agc_buffer[i] + fft_buffer[i]
+        
+        # Amplitude with gain compensation
+        a = np.abs(csi)
         if gain_db != 0:
             a = a / (10 ** (gain_db / 20))
         amp[i, :len(a)] = a
+        
+        # Phase extraction (no gain compensation needed)
+        phase[i, :len(csi)] = np.angle(csi)
     
+    # Apply bandpass filter to amplitude
     if n_pkt > 20:
         for j in range(n_sc):
             amp[:, j] = bandpass(amp[:, j], PACKET_RATE)
     
-    return amp
+    return amp, phase
 
 
-def extract_features(amp):
+def extract_features(amp, phase):
     if amp is None or len(amp) == 0:
         return None
     
     f = {}
+    
+    # amplitude features
     f['mean'] = np.mean(amp)
     f['std'] = np.std(amp)
     f['var'] = np.var(amp)
@@ -93,6 +103,25 @@ def extract_features(amp):
     else:
         f['spectral_energy'] = 0
         f['motion_energy'] = 0
+    
+    # phase features
+    # Unwrap phase to handle 2π discontinuities
+    phase_unwrapped = np.unwrap(phase, axis=1)
+    
+    # Phase variance (indicates signal instability/multipath changes)
+    f['phase_var'] = np.var(phase_unwrapped)
+    f['phase_std'] = np.std(phase_unwrapped)
+    
+    # Temporal phase changes (movement causes phase shifts)
+    phase_diff = np.diff(phase_unwrapped, axis=0)
+    f['phase_diff_mean'] = np.mean(np.abs(phase_diff))
+    f['phase_diff_std'] = np.std(phase_diff)
+    
+    # Spatial phase consistency across subcarriers
+    f['phase_spatial_var'] = np.mean(np.var(phase_unwrapped, axis=1))
+    
+    # Phase range (total phase variation)
+    f['phase_range'] = np.max(phase_unwrapped) - np.min(phase_unwrapped)
     
     return f
 
@@ -202,11 +231,11 @@ class InferenceEngine:
             self.labels = DISPLAY_LABELS
     
     def predict(self, csi, agc, fft):
-        amp = preprocess_window(csi, agc, fft)
+        amp, phase = preprocess_window(csi, agc, fft)
         if amp is None:
             return None, 0.0, None
         
-        features = extract_features(amp)
+        features = extract_features(amp, phase)
         if features is None:
             return None, 0.0, None
         
