@@ -18,7 +18,6 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 PACKET_RATE = 20
 WINDOW_SEC = 2.0
 STEP_SEC = 0.5
-CONFIDENCE_THRESHOLD = 0.5  # 55% confidence minimum
 
 WINDOW_SIZE = int(WINDOW_SEC * PACKET_RATE)
 
@@ -256,10 +255,9 @@ class InferenceEngine:
 
 
 class LiveWindow(QWidget):
-    def __init__(self, model_path, ports, conf_threshold):
+    def __init__(self, model_path, ports):
         super().__init__()
         self.ports = ports
-        self.conf_threshold = conf_threshold
         self.setWindowTitle(f"CSI Live - {len(ports)} Receivers")
         self.setFixedSize(400, 200)
         
@@ -332,17 +330,13 @@ class LiveWindow(QWidget):
             pred, conf, features = self.engine.predict(csi, agc, fft)
             
             if pred is not None and features is not None:
-                # Only count prediction if confidence meets threshold
-                if conf >= self.conf_threshold:
-                    predictions.append(pred)
-                    confidences.append(conf)
-                    all_features.append((i+1, pred, conf, features))
-                    print(f"R{i+1}: var={features['var']:.6f}, std={features['std']:.6f} -> pred={pred}, conf={conf:.2f} ✓")
-                else:
-                    print(f"R{i+1}: var={features['var']:.6f}, std={features['std']:.6f} -> pred={pred}, conf={conf:.2f} (below threshold)")
+                predictions.append(pred)
+                confidences.append(conf)
+                all_features.append((i+1, pred, conf, features))
+                print(f"R{i+1}: var={features['var']:.6f}, std={features['std']:.6f} -> pred={pred}, conf={conf:.2f}")
         
         if not predictions:
-            self.vote_label.setText("Waiting for confident predictions...")
+            self.vote_label.setText("Waiting for predictions...")
             return
         
         # Majority vote across receivers
@@ -364,7 +358,7 @@ class LiveWindow(QWidget):
         label = DISPLAY_LABELS.get(smoothed, f"Class {smoothed}")
         self.pred_label.setText(label)
         self.conf_label.setText(f"{int(avg_conf * 100)}% avg confidence")
-        self.vote_label.setText(f"Vote: {vote_count}/{total_votes} receivers agree | Threshold: {int(self.conf_threshold*100)}%")
+        self.vote_label.setText(f"Vote: {vote_count}/{total_votes} receivers agree")
     
     def closeEvent(self, event):
         for reader in self.readers:
@@ -379,18 +373,14 @@ def main():
     parser.add_argument('-m', '--model', required=True, help="Model file (.pkl)")
     parser.add_argument('-p', '--ports', required=True, nargs='+', 
                         help="Serial ports (one or more receivers, e.g., -p COM3 COM4 COM5)")
-    parser.add_argument('-c', '--confidence', type=float, default=CONFIDENCE_THRESHOLD,
-                        help=f"Confidence threshold (0.0-1.0, default: {CONFIDENCE_THRESHOLD})")
     args = parser.parse_args()
     
     print(f"\n Multi-Receiver CSI Live ")
     print(f"Using {len(args.ports)} receivers: {', '.join(args.ports)}")
-    print(f"Confidence threshold: {int(args.confidence * 100)}%")
-    print(f"Predictions below threshold will be ignored")
     print(f"Majority vote across receivers determines final prediction\n")
     
     app = QApplication(sys.argv)
-    window = LiveWindow(args.model, args.ports, args.confidence)
+    window = LiveWindow(args.model, args.ports)
     window.show()
     sys.exit(app.exec())
 
