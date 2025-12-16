@@ -11,8 +11,9 @@ from collections import deque, Counter
 from scipy import signal
 from scipy.stats import skew, kurtosis
 
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+import pyqtgraph as pg
 
 # Config
 PACKET_RATE = 20
@@ -20,9 +21,18 @@ WINDOW_SEC = 2.0
 STEP_SEC = 0.5
 
 WINDOW_SIZE = int(WINDOW_SEC * PACKET_RATE)
+PLOT_HISTORY = 100  # Number of packets to show in plot
 
 # Display labels
-DISPLAY_LABELS = {0: "NO", 1: "YES"}
+DISPLAY_LABELS = {0: "EMPTY", 1: "ACTIVE"}
+# DISPLAY_LABELS = {0: "EMPTY", 1: "ACTIVE", 2: "STILL"}  # 3-class version
+
+# Colors for each receiver
+RX_COLORS = [
+    (255, 100, 100),  # Red
+    (100, 255, 100),  # Green
+    (100, 100, 255),  # Blue
+]
 
 DEFAULT_FEATURE_ORDER = ['mean', 'std', 'var', 'range', 'skew', 'kurtosis', 
                          'diff_mean', 'diff_std', 'spatial_var', 
@@ -131,12 +141,18 @@ class CSIBuffer:
         self.csi_buffer = deque(maxlen=WINDOW_SIZE * 2)
         self.agc_buffer = deque(maxlen=WINDOW_SIZE * 2)
         self.fft_buffer = deque(maxlen=WINDOW_SIZE * 2)
+        # Separate buffer for plotting (stores raw amplitudes)
+        self.plot_buffer = deque(maxlen=PLOT_HISTORY)
+        self.n_subcarriers = 0
     
     def add_packet(self, csi_complex, agc_gain, fft_gain):
         with self.lock:
             self.csi_buffer.append(csi_complex.copy())
             self.agc_buffer.append(agc_gain)
             self.fft_buffer.append(fft_gain)
+            # Store amplitude for plotting
+            self.plot_buffer.append(np.abs(csi_complex))
+            self.n_subcarriers = len(csi_complex)
     
     def get_window(self):
         with self.lock:
@@ -145,6 +161,13 @@ class CSIBuffer:
             return (list(self.csi_buffer)[-WINDOW_SIZE:],
                     list(self.agc_buffer)[-WINDOW_SIZE:],
                     list(self.fft_buffer)[-WINDOW_SIZE:])
+    
+    def get_plot_data(self):
+        """Get amplitude data for plotting"""
+        with self.lock:
+            if len(self.plot_buffer) == 0:
+                return None
+            return np.array(list(self.plot_buffer))
     
     def ready(self):
         with self.lock:
@@ -259,7 +282,6 @@ class LiveWindow(QWidget):
         super().__init__()
         self.ports = ports
         self.setWindowTitle(f"CSI Live - {len(ports)} Receivers")
-        self.setFixedSize(400, 200)
         
         self.engine = InferenceEngine(model_path)
         self.pred_history = deque(maxlen=5)
@@ -268,29 +290,112 @@ class LiveWindow(QWidget):
         self.buffers = [CSIBuffer() for _ in ports]
         self.readers = []
         
-        layout = QVBoxLayout()
+        # Main layout: plots on left, prediction panel on right
+        main_layout = QHBoxLayout()
         
-        self.pred_label = QLabel("Loading...")
+        # === LEFT SIDE: CSI Plots ===
+        plots_widget = QWidget()
+        plots_layout = QVBoxLayout(plots_widget)
+        plots_layout.setContentsMargins(0, 0, 0, 0)
+        plots_layout.setSpacing(2)
+        
+        self.plot_widgets = []
+        self.plot_curves = []
+        
+        # Subcarriers to plot (every 16th for performance)
+        self.subcarrier_indices = list(range(0, 256, 16))
+        
+        for i, port in enumerate(ports):
+            color = RX_COLORS[i % len(RX_COLORS)]
+            
+            plot_widget = pg.PlotWidget()
+            plot_widget.setBackground('#1e1e1e')
+            plot_widget.setTitle(f"RX{i+1}: {port}", color='w', size='10pt')
+            plot_widget.setLabel('left', 'Amplitude', color='#888')
+            plot_widget.setLabel('bottom', 'Time (packets)', color='#888')
+            plot_widget.showGrid(x=True, y=True, alpha=0.3)
+            plot_widget.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis)
+            plot_widget.setMinimumHeight(150)
+            
+            # Create curves for selected subcarriers
+            curves = []
+            for sc_idx in self.subcarrier_indices:
+                curve = plot_widget.plot([], pen=pg.mkPen(color=color, width=1))
+                curves.append(curve)
+            
+            self.plot_widgets.append(plot_widget)
+            self.plot_curves.append(curves)
+            plots_layout.addWidget(plot_widget)
+        
+        main_layout.addWidget(plots_widget, stretch=3)
+        
+        # prediction panel
+        pred_panel = QFrame()
+        pred_panel.setStyleSheet("""
+            QFrame {
+                background-color: #252526;
+                border-left: 2px solid #3c3c3c;
+            }
+        """)
+        pred_panel.setFixedWidth(280)
+        
+        pred_layout = QVBoxLayout(pred_panel)
+        pred_layout.setContentsMargins(15, 20, 15, 20)
+        
+        # Title
+        title_label = QLabel("PREDICTION")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("font-size: 12px; color: #888; font-weight: bold; letter-spacing: 2px;")
+        pred_layout.addWidget(title_label)
+        
+        pred_layout.addSpacing(20)
+        
+        # Main prediction label
+        self.pred_label = QLabel("...")
         self.pred_label.setAlignment(Qt.AlignCenter)
-        self.pred_label.setStyleSheet("font-size: 48px; font-weight: bold;")
-        layout.addWidget(self.pred_label)
+        self.pred_label.setStyleSheet("""
+            font-size: 42px; 
+            font-weight: bold; 
+            color: #ffffff;
+            padding: 20px;
+            background-color: #333333;
+            border-radius: 10px;
+        """)
+        pred_layout.addWidget(self.pred_label)
         
+        pred_layout.addSpacing(15)
+        
+        # Confidence label
         self.conf_label = QLabel("")
         self.conf_label.setAlignment(Qt.AlignCenter)
-        self.conf_label.setStyleSheet("font-size: 14px; color: gray;")
-        layout.addWidget(self.conf_label)
+        self.conf_label.setStyleSheet("font-size: 14px; color: #aaa;")
+        pred_layout.addWidget(self.conf_label)
         
+        # Vote label
         self.vote_label = QLabel("")
         self.vote_label.setAlignment(Qt.AlignCenter)
         self.vote_label.setStyleSheet("font-size: 12px; color: #666;")
-        layout.addWidget(self.vote_label)
+        pred_layout.addWidget(self.vote_label)
         
-        self.status_label = QLabel("Buffers: 0%")
+        pred_layout.addStretch()
+        
+        # Status label
+        self.status_label = QLabel("Connecting...")
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("font-size: 12px; color: gray;")
-        layout.addWidget(self.status_label)
+        self.status_label.setStyleSheet("font-size: 11px; color: #666;")
+        self.status_label.setWordWrap(True)
+        pred_layout.addWidget(self.status_label)
         
-        self.setLayout(layout)
+        main_layout.addWidget(pred_panel)
+        
+        self.setLayout(main_layout)
+        
+        # Window size based on number of receivers
+        plot_height = 150 * len(ports)
+        self.resize(1000, max(400, plot_height))
+        
+        # Dark theme for window
+        self.setStyleSheet("background-color: #1e1e1e;")
         
         # Start readers for all receivers
         for i, port in enumerate(ports):
@@ -299,9 +404,15 @@ class LiveWindow(QWidget):
             reader.start()
             self.readers.append(reader)
         
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.run_prediction)
-        self.timer.start(int(STEP_SEC * 1000))
+        # Timer for predictions
+        self.pred_timer = QTimer()
+        self.pred_timer.timeout.connect(self.run_prediction)
+        self.pred_timer.start(int(STEP_SEC * 1000))
+        
+        # Timer for plot updates (faster than predictions)
+        self.plot_timer = QTimer()
+        self.plot_timer.timeout.connect(self.update_plots)
+        self.plot_timer.start(100)  # Update plots every 100ms
     
     def on_packet(self):
         # Show buffer status for all receivers
@@ -311,7 +422,20 @@ class LiveWindow(QWidget):
             pct = min(100, int(buf.size() / WINDOW_SIZE * 100))
             statuses.append(f"R{i+1}:{pct}%")
             total_packets += self.readers[i].packet_count
-        self.status_label.setText(f"Buffers: {' | '.join(statuses)} | Total: {total_packets}")
+        self.status_label.setText(f"Buffers: {' | '.join(statuses)}\nTotal packets: {total_packets}")
+    
+    def update_plots(self):
+        """Update the CSI amplitude plots"""
+        for i, buf in enumerate(self.buffers):
+            plot_data = buf.get_plot_data()
+            if plot_data is None or len(plot_data) == 0:
+                continue
+            
+            n_packets, n_sc = plot_data.shape
+            
+            for j, sc_idx in enumerate(self.subcarrier_indices):
+                if j < len(self.plot_curves[i]) and sc_idx < n_sc:
+                    self.plot_curves[i][j].setData(plot_data[:, sc_idx])
     
     def run_prediction(self):
         # Collect predictions from all ready receivers
@@ -357,8 +481,21 @@ class LiveWindow(QWidget):
         
         label = DISPLAY_LABELS.get(smoothed, f"Class {smoothed}")
         self.pred_label.setText(label)
-        self.conf_label.setText(f"{int(avg_conf * 100)}% avg confidence")
-        self.vote_label.setText(f"Vote: {vote_count}/{total_votes} receivers agree")
+        
+        # Color-code the prediction
+        if smoothed == 0:  # NO person
+            self.pred_label.setStyleSheet("""
+                font-size: 42px; font-weight: bold; color: #4CAF50;
+                padding: 20px; background-color: #1b3d1b; border-radius: 10px;
+            """)
+        else:  # YES person (covers class 1, or 1/2 for 3-class)
+            self.pred_label.setStyleSheet("""
+                font-size: 42px; font-weight: bold; color: #FF5722;
+                padding: 20px; background-color: #3d1b1b; border-radius: 10px;
+            """)
+        
+        self.conf_label.setText(f"{int(avg_conf * 100)}% confidence")
+        self.vote_label.setText(f"Vote: {vote_count}/{total_votes} receivers")
     
     def closeEvent(self, event):
         for reader in self.readers:

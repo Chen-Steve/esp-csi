@@ -17,6 +17,7 @@ DATA_DIR = "./data"  # folder containing no_person/ and person_present/ subfolde
 MODEL_PATH = "./csi_model_local.pkl"
 
 LABELS = {0: "no_person", 1: "person_present"}
+# LABELS = {0: "no_person", 1: "person_active", 2: "person_stationary"}  # 3-class version
 WINDOW_SEC = 2.0
 STEP_SEC = 0.5
 PACKET_RATE = 20
@@ -157,7 +158,9 @@ if __name__ == '__main__':
     if len(data) == 0:
         print(f"\nNo data found! Make sure you have:")
         print(f"  {DATA_DIR}/no_person/*.csv")
-        print(f"  {DATA_DIR}/person_present/*.csv")
+        print(f"  {DATA_DIR}/person_active/*.csv")
+        
+        # For 3-class: also need {DATA_DIR}/person_active/*.csv and person_stationary/*.csv
         exit(1)
 
     X, y, feature_names = create_dataset(data)
